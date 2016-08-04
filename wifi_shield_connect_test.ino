@@ -1,15 +1,40 @@
 #include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
+#include <ESP8266HTTPClient.h>
 
-char ssid[] = "ssid";
-char pass[] = "pass";
-char port[] = ":none";
-int status = WL_IDLE_STATUS;
+// constants
+const char ssid[] = "";
+const char pass[] = "";
+const int status = WL_IDLE_STATUS;
+const char server[] = "";
+const char port[] = "";
+const int timeBetweenSignalPosts = 60 * 1000 * 2;
+const int maxWifiConnectWait = 5 * 1000;
 
-char server[] = "noneya";
+// pins
+const int sensorPin = D2;
+
+// state
+int sensorState = LOW; // LOW represents no motion, HIGH represents motion
+int sensorVal = 0;
+int sensorMotionDuration = 0;
+int timeSinceLastSignalPost = 0;
+int wifiConnectWait = 0;
+
+// connector
+ESP8266WiFiMulti WiFiMulti;
 WiFiClient client;
+
+// functions
+int wifiConnect();
+void postReset();
+void checkForMotion();
 
 void setup() {
   Serial.begin(9600);
+  pinMode(sensorPin, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  WiFiMulti.addAP(ssid, pass);
   while (!Serial);
 
   if (WiFi.status() == WL_NO_SHIELD) {
@@ -17,62 +42,101 @@ void setup() {
     while (true);
   }
 
-  wifiConnect();
-
-  Serial.print("Connected!");
+  postReset();
 }
 
 void loop() {
   // check the network connection once every two minutes:
-  postSignalStrength();
-  delay(120000);
+  checkForMotion();
 }
 
-void wifiConnect() {
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print("Connecting to WPA SSID: ");
-    Serial.println(ssid);
-    WiFi.begin(ssid, pass);
-
-    Serial.print("Connection status: ");
-    Serial.println(WiFi.status());
-    
-    delay(5000);
+int wifiConnect() {
+  while (WiFiMulti.run() != WL_CONNECTED) {
+    delay(100);
   }
 
-  // connect to server
-  if (!client.connected()) {
-    client.stop();
+  return 1;
+}
+
+void post(const char *host, const char *port, const char *path, const char *params) {
+  wifiConnect();
+  
+  HTTPClient http;
+  char url[80];
+  strcpy(url, "http://");
+  strcat(url, host);
+  strcat(url, ":");
+  strcat(url, port);
+  strcat(url, "/");
+  strcat(url, path);
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  if (strlen(params) == 0) {
+    http.addHeader("content-length", "0");
   }
-  if (!client.connect(server, 3000)) {
-    Serial.print("Could not connect to ");
-    Serial.println(server);
-    while(true);
+  
+  Serial.printf("[HTTP] Posting to %s\n", url);
+  int httpCode = http.POST(params);
+  if (httpCode != HTTP_CODE_OK && httpCode != HTTP_CODE_CREATED) {
+    Serial.printf("[HTTP] Post failed! Error: %d : %s\n", httpCode, http.errorToString(httpCode).c_str());
   }
+}
+
+void postReset() {
+  post(server, "3000", "resets.json", "");
 }
 
 void postSignalStrength() {
+  char params[100];
+  sprintf(params, "temperaturef=%d", WiFi.RSSI());
+  post(server, "3000", "temperature_entries.json", params);
+}
+
+void postMotionDuration() {
+  char params[100];
+  sprintf(params, "duration_seconds=%d", sensorMotionDuration);
+  post(server, "3000", "motions.json", params);
+}
+
+void advancedDelay(int delayMs) {
+  timeSinceLastSignalPost += delayMs;
+
+  if (sensorState == HIGH) {
+    sensorMotionDuration += delayMs;
+  }
+
+  delay(delayMs);
+}
+
+void checkForMotion() {
   // check wifi connection status
   wifiConnect();
-  
-  Serial.println("Posting RSSI (signal strength)");
-  client.print("POST /temperature_entries.json?temperaturef=");
-  client.print(WiFi.RSSI());
-  client.println(" HTTP/1.1");
-  
-  client.print("Host: ");
-  client.print(server);
-  client.println(port);
 
-  client.println("content-length: 0");
-  client.println();
-
-  Serial.println("Posted!");
-
-  // now read from the client
-  while (client.available()) {
-    char c = client.read();
-    Serial.write(c);
+  if (timeSinceLastSignalPost >= timeBetweenSignalPosts) {
+    postSignalStrength();
+    timeSinceLastSignalPost = 0;
   }
+
+  sensorVal = digitalRead(sensorPin);   // read sensor value
+  if (sensorVal == HIGH) {           // check if the sensor is HIGH
+    advancedDelay(100);                // delay 100 milliseconds
+
+    if (sensorState == LOW) {
+      Serial.println("Motion detected!");
+      digitalWrite(LED_BUILTIN, LOW);
+      sensorMotionDuration = 0;
+      sensorState = HIGH;       // update variable state to HIGH
+    }
+  } else {
+    advancedDelay(200);             // delay 200 milliseconds
+
+    if (sensorState == HIGH) {
+      Serial.printf("Motion stopped after %d seconds.\n", sensorMotionDuration);
+      digitalWrite(LED_BUILTIN, HIGH);
+      sensorState = LOW;       // update variable state to LOW
+      postMotionDuration();
+    }
+  }
+
 }
 
